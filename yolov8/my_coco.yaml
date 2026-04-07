@@ -1,0 +1,16 @@
+# 十字线交叉点 Pose 关键点检测配置文件
+path: E:/code/ImageRecognition/yolov8/dataset  # 数据集根目录
+train: train/images  # 训练集图片路径（相对path）
+val: val/images      # 验证集图片路径（相对path）
+
+# 类别信息
+names:
+  0: CrossIntersection
+  1: StudCenter
+
+# 关键点配置（适配YOLOv8 Pose，单十字交叉点）
+keypoints:
+  - cross_point  # 关键点名称：十字线交叉点
+  - center_point
+kpt_shape: [2, 2]  # [关键点数量, 坐标维度(x,y)]，固定为[1,2]
+flip_idx: []  # 单关键点无需配置翻转对应关系，留空即可

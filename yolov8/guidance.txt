@@ -1,0 +1,4 @@
+# 关键点训练命令，适配8G显存（batch=16，可根据显存调整为8）
+yolo pose train data=my_coco.yaml model=yolov8s-pose.pt epochs=300 imgsz=640 batch=16 workers=0 device=0 lr0=0.0005
+yolo pose train data=my_coco.yaml model=yolov8m-pose.pt epochs=300 imgsz=640 batch=16 workers=0 device=0 lr0=0.0005
+yolo pose train data=my_coco.yaml model=yolov8l-pose.pt epochs=300 imgsz=640 batch=16 workers=0 device=0 lr0=0.0005

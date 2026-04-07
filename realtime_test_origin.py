@@ -1,0 +1,501 @@
+import cv2
+import numpy as np
+from sympy import deg, degree
+from camera import Camera  # 导入相机类
+from ultralytics import YOLO
+import os
+from threading import Lock, Thread, Event
+import time
+import random
+from datetime import datetime
+
+# ===================== 【伽马调整参数】=====================
+# 智能亮度检测阈值（核心）
+DARK_THRESHOLD = 80  # 平均值 < 该值 → 判断为暗图，自动提亮
+# 暗图使用的伽马值（gamma越大越亮）
+DARK_GAMMA_RANGE = (1.8, 2.8)
+# 亮图使用的伽马值（=1.0 不处理）
+BRIGHT_GAMMA = 1.0
+# 对比度（统一）
+CONTRAST_RANGE = (1.0, 1.2)
+USE_RANDOM_PARAMS = False  # 实时检测不使用随机参数，保证结果稳定
+# ==========================================================
+
+
+class RealTimePoseDetector:
+    _instance = None
+    _instance_lock = Lock()  # 线程安全的单例锁
+
+    def __new__(cls, *args, **kwargs):
+        """线程安全的单例实现"""
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self, camera_index=0, model_path_stud=None, model_path_cross=None,model_path_u=None, save_frame_path="data/frame.jpg"):
+        """防止重复初始化"""
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        
+        # 初始化核心属性
+        self.camera_index = camera_index
+        self.camera = Camera(device_index=camera_index)
+        self.camera_connected = False
+        self.model_stud = None
+        self.model_cross = None
+        self.model_u = None
+        self.save_frame_path = save_frame_path
+        self.frame_lock = Lock()
+        self.current_frame = None
+        self.detection_result_stud = None
+        self.detection_result_cross = None
+        self.detection_result_u = None
+        self.detection_result_board_angle = None
+        self.detection_result_board_position = None
+        self.running = False  # 初始为 False，避免自动运行
+
+        # 检测线程相关
+        self.detection_thread = None
+        self.detection_event = Event()
+        self.new_frame_event = Event()
+        self.detection_conf = 0.25
+
+        # 相机断连检测相关
+        self.last_frame_time = 0  # 最后一次接收到帧的时间
+        self.disconnect_threshold = 2.0  # 超过2秒无帧则判定为断开
+        self.reconnect_interval = 1.0  # 重连间隔（秒）
+        self.reconnect_attempts = 0  # 当前重连尝试次数
+        self.is_reconnecting = False  # 是否正在重连中
+        
+        # 加载模型
+        if model_path_stud and os.path.exists(model_path_stud):
+            self.model_stud = YOLO(model_path_stud)
+            print(f"成功加载螺钉检测模型：{model_path_stud}")
+        else:
+            raise ValueError(f"螺钉模型路径不存在：{model_path_stud}")
+        
+        if model_path_cross and os.path.exists(model_path_cross):
+            self.model_cross = YOLO(model_path_cross)
+            print(f"成功加载十字交叉点检测模型：{model_path_cross}")
+        else:
+            raise ValueError(f"十字交叉点模型路径不存在：{model_path_cross}")
+        if model_path_u and os.path.exists(model_path_u):
+            self.model_u = YOLO(model_path_u)
+            print(f"成功加载U型件六角螺套检测模型:{model_path_u}")
+        else:
+            raise ValueError(f"U型件六角螺套模型路径不存在：{model_path_u}")
+        self._initialized = True  # 标记已初始化
+
+
+
+    # ===================== 【新增：伽马调整相关方法】=====================
+    def calculate_brightness(self, image):
+        """计算图片平均亮度（0~255，数值越小越暗）"""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return np.mean(gray)
+
+    def adjust_gamma(self, image, gamma=2.0):
+        """伽马提亮：gamma越大越亮，1.0=原图"""
+        inv_gamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** inv_gamma) * 255
+                        for i in np.arange(0, 256)]).astype("uint8")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}]已使用gamma校正增强图像")
+        return cv2.LUT(image, table)
+
+    def adjust_contrast(self, img, alpha=1.0):
+        """调整对比度"""
+        return cv2.convertScaleAbs(img, alpha=alpha, beta=0)
+
+    def process_frame(self, frame):
+        """处理帧（伽马+对比度）"""
+        # 计算亮度
+        avg_bright = self.calculate_brightness(frame)
+        is_dark = avg_bright < DARK_THRESHOLD
+        
+        # 选择伽马值
+        if is_dark:
+            gamma = random.uniform(*DARK_GAMMA_RANGE) if USE_RANDOM_PARAMS else 2.2
+        else:
+            gamma = BRIGHT_GAMMA
+        
+        # 选择对比度
+        contrast = random.uniform(*CONTRAST_RANGE) if USE_RANDOM_PARAMS else 1.0
+        
+        # 应用伽马和对比度调整
+        frame_gamma = self.adjust_gamma(frame, gamma=gamma)
+        frame_processed = self.adjust_contrast(frame_gamma, alpha=contrast)
+        
+        return frame_processed, avg_bright, gamma
+    # =====================================================================
+
+    def connect_camera(self):
+        """连接相机（防止重复连接）"""
+        if self.camera_connected:
+            return True
+        if self.camera.connect():
+            self.camera_connected = True
+            self.last_frame_time = time.time()  # 初始化最后帧时间
+            print("相机连接成功！")
+            self.camera.start_video_stream(callback=self._frame_callback)
+            return True
+        else:
+            print("相机连接失败！")
+            return False
+
+    def disconnect_camera(self):
+        """断开相机连接"""
+        self.camera_connected = False
+        self.camera.stop_video_stream()
+        self.camera.disconnect()
+        print("相机已断开连接")
+
+    def reconnect_camera(self):
+        """尝试重新连接相机"""
+        if self.is_reconnecting:
+            return False  # 已经在重连中，避免重复
+
+        self.is_reconnecting = True
+        print(f"尝试重新连接相机... (第 {self.reconnect_attempts + 1} 次)")
+
+        # 清理旧连接
+        try:
+            self.camera.stop_video_stream()
+            self.camera.disconnect()
+        except Exception as e:
+            print(f"清理旧连接时出错（可忽略）: {e}")
+
+        # 等待资源释放
+        time.sleep(0.5)
+
+        # 重新创建相机对象
+        self.camera = Camera(device_index=self.camera_index)
+
+        # 尝试连接
+        if self.camera.connect():
+            self.camera_connected = True
+            self.reconnect_attempts = 0  # 重置计数
+            self.is_reconnecting = False
+
+            print("相机重连成功！启动视频流...")
+            self.camera.start_video_stream(callback=self._frame_callback)
+
+            # 等待第一帧
+            print("等待第一帧...")
+            wait_start = time.time()
+            while time.time() - wait_start < 2.0:
+                with self.frame_lock:
+                    if self.current_frame is not None:
+                        # 重置最后帧时间
+                        self.last_frame_time = time.time()
+                        print("已接收到视频流，重连完成！")
+                        return True
+                time.sleep(0.1)
+
+            print("警告：相机已连接但未收到视频帧")
+            return True
+        else:
+            self.reconnect_attempts += 1
+            self.is_reconnecting = False
+            print(f"相机重连失败 (尝试 {self.reconnect_attempts} 次)")
+            return False
+
+    def _frame_callback(self, frame):
+        """帧回调函数"""
+        with self.frame_lock:
+            self.current_frame = frame.copy()
+
+        # 记录最后接收到帧的时间
+        self.last_frame_time = time.time()
+
+        # 通知检测线程有新帧
+        self.new_frame_event.set()
+
+    def _detection_loop(self):
+        """独立的检测线程循环，在后台持续运行"""
+        while self.running:
+            try:
+                # 等待新帧到达
+                self.new_frame_event.wait(timeout=0.1)
+                self.new_frame_event.clear()
+
+                if not self.running:
+                    break
+
+                # 执行检测
+                with self.frame_lock:
+                    if self.current_frame is None:
+                        continue
+                    frame_to_detect = self.current_frame.copy()
+                # 螺钉检测 - 先处理帧（伽马调整）
+                intensive_frame, avg_bright, gamma = self.process_frame(frame_to_detect)
+                results_stud = self.model_stud.predict(
+                    source=intensive_frame,
+                    imgsz=1280,
+                    conf=0,
+                    save=False,
+                    show=False,
+                    verbose=False,
+                    stream=True,
+                    max_det=1
+                    
+                )
+                detection_info_stud = self._parse_detection_results(results_stud, self.model_stud)
+
+                # 十字交叉点检测，碰钉十字线和装板十字线定位公用同一模型，检测结果中区分
+                results_cross = self.model_cross.predict(
+                    source=intensive_frame,
+                    imgsz=1920,
+                    conf=0.25,
+                    save=False,
+                    show=False,
+                    verbose=False,
+                    stream=True,
+                    max_det=2#若后续装板十字线设置3个检测点，则这里需要改为3，请注意！！！
+                )
+                detection_info_cross = self._parse_detection_results(results_cross, self.model_cross)
+                detection_info_board_angle = self.calculate_board_angle(detection_info_cross)
+                detection_info_board_position = self.calculate_board_position(detection_info_cross)
+
+                # U型件六角螺套检测
+                results_u = self.model_u.predict(
+                    source=intensive_frame,
+                    imgsz=1280,
+                    conf=0.25,
+                    save=False,
+                    show=False,
+                    verbose=False,
+                    stream=True,
+                    max_det=1
+                )
+                detection_info_u = self._parse_detection_results(results_u, self.model_u)
+
+                # 更新检测结果（使用锁保证线程安全）
+                with self.frame_lock:
+                    self.detection_result_stud = detection_info_stud
+                    self.detection_result_cross = detection_info_cross
+                    self.detection_result_u = detection_info_u
+                    self.detection_result_board_angle = detection_info_board_angle
+                    self.detection_result_board_position = detection_info_board_position
+
+            except Exception as e:
+                print(f"检测线程出错: {e}")
+                time.sleep(0.1)
+
+        print("检测线程已停止")
+
+    def calculate_board_angle(self, cross_points):
+        """计算装板角度（优化版本）"""
+        if len(cross_points) == 2:
+            # 按 X 坐标排序，保证方向一致
+            sorted_points = sorted(cross_points, key=lambda p: p[0])
+            x1, y1 = sorted_points[0]
+            x2, y2 = sorted_points[1]
+            
+            # 处理垂直线
+            if abs(x2 - x1) < 1e-6:
+                return round(np.pi / 2 if y2 > y1 else -np.pi / 2, 5)
+            
+            angle_rad = np.arctan2(y2 - y1, x2 - x1)
+            return round(angle_rad, 5)
+            
+        elif len(cross_points) >= 3:
+            # 使用更多点进行拟合
+            x_coords = np.array([pt[0] for pt in cross_points])
+            y_coords = np.array([pt[1] for pt in cross_points])
+            
+            # 检查垂直线
+            if np.ptp(x_coords) < 1e-6:  # ptp = peak to peak (max - min)
+                return round(np.pi / 2, 5)
+            
+            # 最小二乘拟合
+            A = np.vstack([x_coords, np.ones(len(x_coords))]).T
+            m, c = np.linalg.lstsq(A, y_coords, rcond=None)[0]
+            angle_rad = np.arctan(m)
+            return round(angle_rad, 5)
+        
+        return None
+    
+    def calculate_board_position(self, cross_points):
+        """计算装板位置（使用所有点的几何中心）"""
+        if not cross_points or len(cross_points) < 2:
+            return None
+        
+        # 转换为 numpy 数组以便计算
+        points_array = np.array(cross_points)
+        
+        # 计算所有点的几何中心（质心）
+        center_x = round(np.mean(points_array[:, 0]), 2)
+        center_y = round(np.mean(points_array[:, 1]), 2)
+        
+        return (center_x, center_y)
+         
+    
+
+
+    def _parse_detection_results(self, results, model):
+        """解析检测结果"""
+        detection_info = []
+        for result in results:
+            keypoints = result.keypoints
+            if keypoints is not None and keypoints.xy is not None:
+                for obj_idx, kpt in enumerate(keypoints.xy):
+                    for point_idx, (x, y) in enumerate(kpt):
+                        pixel_x = round(x.item(), 2)
+                        pixel_y = round(y.item(), 2)
+                        detection_info.append([pixel_x,pixel_y])
+        return detection_info
+
+    def draw_detection_result(self):
+        """绘制检测结果"""
+        with self.frame_lock:
+            if self.current_frame is None:
+                return None
+            frame = self.current_frame.copy()
+        
+        if len(frame.shape) == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        
+        # 绘制螺钉（蓝色）
+        if self.detection_result_stud:
+            for info in self.detection_result_stud:
+                x, y = int(info[0]), int(info[1])
+                cv2.circle(frame, (x, y), 6, (255, 0, 0), -1)
+
+        # 绘制十字交叉点（红色）
+        if self.detection_result_cross:
+            for info in self.detection_result_cross:
+                x, y = int(info[0]), int(info[1])
+                cv2.circle(frame, (x, y), 6, (0, 0, 255), -1)
+
+        # 绘制装板角度信息
+        if self.detection_result_board_angle is not None:
+            degree = round(deg(self.detection_result_board_angle), 2)
+            cv2.putText(frame, f"Board Angle: {degree} degree", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        else:
+            cv2.putText(frame, "Board Angle: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    
+        # 绘制装板中心点位置信息(绿色)
+        if self.detection_result_board_position is not None:
+            pos_x, pos_y = self.detection_result_board_position
+            cv2.circle(frame, (int(pos_x), int(pos_y)), 6, (0, 255, 0), -1)
+
+        # 绘制U型件六角螺套中心（黄色）
+        if self.detection_result_u is not None:
+            for info in self.detection_result_u:
+                x, y = int(info[0]), int(info[1])
+                cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
+        return frame
+
+    def run(self, window_name="Real-Time Dual Model Detection"):
+        """启动检测主循环"""
+
+        # 初始化最后帧时间（即使没有相机也设置）
+        if self.last_frame_time == 0:
+            self.last_frame_time = time.time()
+
+        # 尝试连接相机，如果失败也不退出，而是进入主循环持续重连
+        self.connect_camera()
+
+        self.running = True  # 标记为运行中
+
+        # 启动检测线程
+        self.detection_thread = Thread(target=self._detection_loop, daemon=True)
+        self.detection_thread.start()
+        print("检测线程已启动")
+
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_EXPANDED)
+        cv2.resizeWindow(window_name, 1280, 720)
+        cv2.moveWindow(window_name, 100, 100)
+
+        print("实时模型检测已启动，按 'q' 或 'ESC' 退出...")
+        print("显示和检测已分离，帧率已提升")
+        print("相机断连自动重连已启用")
+        try:
+            while self.running:
+                # 检查相机状态
+                current_time = time.time()
+                time_since_last_frame = current_time - self.last_frame_time
+
+                # 如果超过阈值没有收到帧，尝试连接/重连
+                if time_since_last_frame > self.disconnect_threshold and not self.is_reconnecting:
+                    if not self.camera_connected:
+                        print(f"未检测到相机，尝试连接... ({time_since_last_frame:.1f}秒无帧)")
+                    else:
+                        print(f"检测到相机可能已断开 ({time_since_last_frame:.1f}秒无帧)")
+                        self.disconnect_camera()
+
+                    # 尝试连接/重连
+                    while self.running and not self.is_reconnecting:
+                        if self.reconnect_camera():
+                            with self.frame_lock:
+                                self.current_frame = None
+                            break
+                        else:
+                            print(f"等待 {self.reconnect_interval} 秒后重试...")
+                            time.sleep(self.reconnect_interval)
+
+                # 直接显示当前帧（不等待检测完成）
+                display_frame = self.draw_detection_result()
+
+                if display_frame is not None:
+                    cv2.imshow(window_name, display_frame)
+
+                key = cv2.waitKey(1) & 0xFF  # 改为1ms以获得更高帧率
+                if key in [ord('q'), ord('Q'), 27]:
+                    self.running = False
+                    print("\n检测退出中...")
+                    break
+
+        except Exception as e:
+            print(f"\n检测过程出错：{str(e)}")
+            import traceback
+            traceback.print_exc()
+            self.running = False
+        finally:
+            self.running = False
+
+            # 等待检测线程结束
+            if self.detection_thread and self.detection_thread.is_alive():
+                print("等待检测线程结束...")
+                self.detection_thread.join(timeout=2.0)
+
+            self.camera.stop_video_stream()
+            self.camera.disconnect()
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+            print("实时检测已停止，所有资源已释放")
+
+    def get_result(self):
+        """修复：无论是否运行都返回当前最新结果"""
+        result = {
+            "stud": self.detection_result_stud if self.detection_result_stud else [],
+            "cross": self.detection_result_cross if self.detection_result_cross else [],
+            "board_angle": self.detection_result_board_angle if self.detection_result_board_angle is not None else None,
+            "board_position": self.detection_result_board_position if self.detection_result_board_position is not None else None,
+            "u": self.detection_result_u if self.detection_result_u else []
+        }
+        print(f"获取检测结果 - 螺钉：{result['stud']} | 十字交叉点：{result['cross']} | 板角度：{result['board_angle']} | 板位置：{result['board_position']} | U型件：{result['u']}")
+        return result
+
+# 全局配置
+CAMERA_INDEX = 0
+MODEL_PATH_STUD = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-stud\weights\stud-best-1280-14.pt"
+MODEL_PATH_CROSS = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-cross\weights\cross-x-1920-9.pt"
+MODEL_PATH_U = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-u\weights\u-l-1280-1.pt"
+SAVE_FRAME_PATH = "data/frame.jpg"
+# DETECT_CONF = 0.05
+
+# 创建全局唯一实例（关键：确保所有地方导入的是同一个）
+detector = RealTimePoseDetector(
+    camera_index=CAMERA_INDEX,
+    model_path_stud=MODEL_PATH_STUD,
+    model_path_cross=MODEL_PATH_CROSS,
+    model_path_u=MODEL_PATH_U,
+    save_frame_path=SAVE_FRAME_PATH
+)
+
+if __name__ == "__main__":
+    # 启动检测（单独运行时执行）
+    detector.run()
