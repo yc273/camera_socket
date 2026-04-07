@@ -1,9 +1,6 @@
 # 数据目录
 data/
 
-# 训练输出和权重
-runs/
-
 # Python
 __pycache__/
 *.py[cod]
