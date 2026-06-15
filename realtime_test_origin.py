@@ -1,6 +1,8 @@
 import cv2
+from dateutil.rrule import MO
 import numpy as np
 from sympy import deg, degree
+from torch import obj, res
 from camera import Camera  # 导入相机类
 from ultralytics import YOLO
 import os
@@ -8,6 +10,25 @@ from threading import Lock, Thread, Event
 import time
 import random
 from datetime import datetime
+
+# ===================== 全局共享帧 ======================
+# 任何模块都可以直接导入这个变量来访问相机帧
+_global_shared_frame = None
+_global_frame_lock = Lock()
+
+def get_shared_frame():
+    """获取共享的相机帧（线程安全）"""
+    with _global_frame_lock:
+        if _global_shared_frame is not None:
+            return _global_shared_frame.copy()
+        return None
+
+def set_shared_frame(frame):
+    """设置共享的相机帧（线程安全）"""
+    with _global_frame_lock:
+        global _global_shared_frame
+        _global_shared_frame = frame.copy() if frame is not None else None
+# ========================================================
 
 # ===================== 【伽马调整参数】=====================
 # 智能亮度检测阈值（核心）
@@ -34,7 +55,7 @@ class RealTimePoseDetector:
                     cls._instance = super().__new__(cls)
         return cls._instance
     
-    def __init__(self, camera_index=0, model_path_stud=None, model_path_cross=None,model_path_u=None, save_frame_path="data/frame.jpg"):
+    def __init__(self, camera_index=0, model_path_stud=None, model_path_cross=None,model_path_u=None, model_path_slot=None, model_path_detect=None, save_frame_path="data/frame.jpg"):
         """防止重复初始化"""
         if hasattr(self, '_initialized') and self._initialized:
             return
@@ -46,14 +67,20 @@ class RealTimePoseDetector:
         self.model_stud = None
         self.model_cross = None
         self.model_u = None
+        self.model_slot = None
+        self.model_detect = None
         self.save_frame_path = save_frame_path
         self.frame_lock = Lock()
         self.current_frame = None
         self.detection_result_stud = None
         self.detection_result_cross = None
+        self.detection_result_board = None
         self.detection_result_u = None
+        self.detection_result_slot = None
+        self.detection_result_slot_origin = None
         self.detection_result_board_angle = None
         self.detection_result_board_position = None
+        self.detection_result_detect = None
         self.running = False  # 初始为 False，避免自动运行
 
         # 检测线程相关
@@ -86,6 +113,16 @@ class RealTimePoseDetector:
             print(f"成功加载U型件六角螺套检测模型:{model_path_u}")
         else:
             raise ValueError(f"U型件六角螺套模型路径不存在：{model_path_u}")
+        if model_path_slot and os.path.exists(model_path_slot):
+            self.model_slot = YOLO(model_path_slot)
+            print(f"成功加载十字接缝检测模型:{model_path_slot}")
+        else:
+            raise ValueError(f"十字接缝模型路径不存在：{model_path_slot}")
+        if model_path_detect and os.path.exists(model_path_detect):
+            self.model_detect = YOLO(model_path_detect)
+            print(f"成功加载螺钉反馈检测模型:{model_path_detect}")
+        else:
+            raise ValueError(f"螺钉反馈检测模型路径不存在：{model_path_detect}")
         self._initialized = True  # 标记已初始化
 
 
@@ -101,7 +138,7 @@ class RealTimePoseDetector:
         inv_gamma = 1.0 / gamma
         table = np.array([((i / 255.0) ** inv_gamma) * 255
                         for i in np.arange(0, 256)]).astype("uint8")
-        print(f"[{datetime.now().strftime('%H:%M:%S')}]已使用gamma校正增强图像")
+        # print(f"[{datetime.now().strftime('%H:%M:%S')}]已使用gamma校正增强图像")
         return cv2.LUT(image, table)
 
     def adjust_contrast(self, img, alpha=1.0):
@@ -206,6 +243,9 @@ class RealTimePoseDetector:
         with self.frame_lock:
             self.current_frame = frame.copy()
 
+        # 更新全局共享帧（其他模块可以直接访问）
+        set_shared_frame(frame)
+
         # 记录最后接收到帧的时间
         self.last_frame_time = time.time()
 
@@ -246,17 +286,20 @@ class RealTimePoseDetector:
                 # 十字交叉点检测，碰钉十字线和装板十字线定位公用同一模型，检测结果中区分
                 results_cross = self.model_cross.predict(
                     source=intensive_frame,
-                    imgsz=1920,
-                    conf=0.25,
+                    imgsz=1280,
+                    conf=0,
                     save=False,
                     show=False,
                     verbose=False,
                     stream=True,
-                    max_det=2#若后续装板十字线设置3个检测点，则这里需要改为3，请注意！！！
+                    max_det=2,#若后续装板十字线设置3个检测点，则这里需要改为3，请注意！！！
+                    # save_txt=True,
+                    # save_conf=True,
                 )
-                detection_info_cross = self._parse_detection_results(results_cross, self.model_cross)
-                detection_info_board_angle = self.calculate_board_angle(detection_info_cross)
-                detection_info_board_position = self.calculate_board_position(detection_info_cross)
+                detection_info_cross_all, detection_info_cross_single = self._parse_detection_results_with_confidence(results_cross, self.model_cross)
+                detection_info_board_angle = self.calculate_board_angle(detection_info_cross_all)
+                detection_info_board_position = self.calculate_board_position(detection_info_cross_all)
+    
 
                 # U型件六角螺套检测
                 results_u = self.model_u.predict(
@@ -271,19 +314,60 @@ class RealTimePoseDetector:
                 )
                 detection_info_u = self._parse_detection_results(results_u, self.model_u)
 
+                results_slot = self.model_slot.predict(
+                    source=intensive_frame,
+                    imgsz=1280,
+                    conf=0.25,
+                    save=False,
+                    show=False,
+                    verbose=False,
+                    stream=True,
+                    max_det=1
+                )
+                detection_result_slot_origin = self._parse_detection_results(results_slot, self.model_slot)#保存原始检测点位置信息，供后续计算使用
+                detection_result_slot = self.calculate_slot_position(detection_result_slot_origin)#计算十字接缝位置（使用所有点的几何中心）
+
+                results_detect = self.model_detect.predict(
+                    source=intensive_frame,
+                    imgsz=1280,
+                    conf=0.5,
+                    save=True,
+                    show=False,
+                    verbose=False,
+                    stream=True
+                )
+                detection_result_detect = self._parse_detection_results_box(results_detect, self.model_detect)
+
                 # 更新检测结果（使用锁保证线程安全）
                 with self.frame_lock:
                     self.detection_result_stud = detection_info_stud
-                    self.detection_result_cross = detection_info_cross
+                    self.detection_result_cross = detection_info_cross_single
+                    self.detection_result_board = detection_info_cross_all
                     self.detection_result_u = detection_info_u
                     self.detection_result_board_angle = detection_info_board_angle
                     self.detection_result_board_position = detection_info_board_position
+                    self.detection_result_slot = detection_result_slot
+                    self.detection_result_detect = detection_result_detect
 
             except Exception as e:
                 print(f"检测线程出错: {e}")
                 time.sleep(0.1)
 
         print("检测线程已停止")
+
+    def calculate_slot_position(self, slot_points):
+        """计算十字接缝位置（使用所有点的几何中心）"""
+        if not slot_points or len(slot_points) < 2:
+            return None
+        
+        # 转换为 numpy 数组以便计算
+        points_array = np.array(slot_points)
+        
+        # 计算所有点的几何中心（质心）
+        center_x = round(np.mean(points_array[:, 0]), 2)
+        center_y = round(np.mean(points_array[:, 1]), 2)
+        
+        return (center_x, center_y)
 
     def calculate_board_angle(self, cross_points):
         """计算装板角度（优化版本）"""
@@ -319,6 +403,7 @@ class RealTimePoseDetector:
     
     def calculate_board_position(self, cross_points):
         """计算装板位置（使用所有点的几何中心）"""
+        # print(f"计算装板位置，输入十字交叉点: {cross_points}")
         if not cross_points or len(cross_points) < 2:
             return None
         
@@ -328,7 +413,7 @@ class RealTimePoseDetector:
         # 计算所有点的几何中心（质心）
         center_x = round(np.mean(points_array[:, 0]), 2)
         center_y = round(np.mean(points_array[:, 1]), 2)
-        
+        # print(f"装板位置: ({center_x}, {center_y})")
         return (center_x, center_y)
          
     
@@ -339,6 +424,7 @@ class RealTimePoseDetector:
         detection_info = []
         for result in results:
             keypoints = result.keypoints
+            # print(keypoints)
             if keypoints is not None and keypoints.xy is not None:
                 for obj_idx, kpt in enumerate(keypoints.xy):
                     for point_idx, (x, y) in enumerate(kpt):
@@ -346,6 +432,43 @@ class RealTimePoseDetector:
                         pixel_y = round(y.item(), 2)
                         detection_info.append([pixel_x,pixel_y])
         return detection_info
+    
+    def _parse_detection_results_box(self, results, model):
+        """解析检测结果 - 返回检测框的坐标"""
+        box_info = []
+        for result in results:
+            if result.boxes is not None:
+                print(result.boxes)
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0]
+                    box_info.append([round(x1.item(), 2), round(y1.item(), 2), round(x2.item(), 2), round(y2.item(), 2)])
+        return box_info
+
+
+    def _parse_detection_results_with_confidence(self, results, model):
+        """解析检测结果 - 返回所有点和置信度最大的点"""
+        all_points = []
+        # 根据试验，置信度最大的点为检测结果中的第一个点（即使模型设置了max_det>1），因此直接取第一个点的置信度进行比较即可，无需遍历所有点的置信度
+        best_point = None
+        for result in results:
+            keypoints = result.keypoints
+            if keypoints is not None and keypoints.xy is not None:
+                for obj_idx, kpt in enumerate(keypoints.xy):
+                    try:
+                        x, y = kpt[0]
+                        point = [round(float(x), 2), round(float(y), 2)]
+                        all_points.append(point)
+                        
+                        if obj_idx == 0 or best_point is None:  # 直接取第一个点作为最佳点
+                            best_point = point
+                    except Exception as e:
+                        print(f"解析关键点出错: {e}")
+                        continue
+        
+        single_point = [best_point] if best_point is not None else []
+        return all_points, single_point
+
+
 
     def draw_detection_result(self):
         """绘制检测结果"""
@@ -369,12 +492,35 @@ class RealTimePoseDetector:
                 x, y = int(info[0]), int(info[1])
                 cv2.circle(frame, (x, y), 6, (0, 0, 255), -1)
 
+        # 绘制装板（紫色）
+        if self.detection_result_board:
+            for info in self.detection_result_board:
+                x, y = int(info[0]), int(info[1])
+                cv2.circle(frame, (x, y), 6, (255, 0, 255), -1)
+
         # 绘制装板角度信息
         if self.detection_result_board_angle is not None:
             degree = round(deg(self.detection_result_board_angle), 2)
             cv2.putText(frame, f"Board Angle: {degree} degree", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         else:
             cv2.putText(frame, "Board Angle: N/A", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        # 绘制检测目标数量和检测框
+        detect_count = len(self.detection_result_detect) if self.detection_result_detect else 0
+        cv2.putText(frame, f"Detect Count: {detect_count}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        
+        if self.detection_result_detect:
+            for box in self.detection_result_detect:
+                try:
+                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    h, w = frame.shape[:2]
+                    x1 = max(0, min(x1, w))
+                    y1 = max(0, min(y1, h))
+                    x2 = max(0, min(x2, w))
+                    y2 = max(0, min(y2, h))
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                except Exception as e:
+                    print(f"绘制检测框出错: {e}, box={box}")
     
         # 绘制装板中心点位置信息(绿色)
         if self.detection_result_board_position is not None:
@@ -386,6 +532,18 @@ class RealTimePoseDetector:
             for info in self.detection_result_u:
                 x, y = int(info[0]), int(info[1])
                 cv2.circle(frame, (x, y), 6, (0, 255, 255), -1)
+
+        # 绘制十字接缝中心（紫色）
+        if self.detection_result_slot is not None:
+            x, y = int(self.detection_result_slot[0]), int(self.detection_result_slot[1])
+            cv2.circle(frame, (x, y), 6, (255, 0, 255), -1)
+        
+        # 绘制十字接缝4个检测点（紫色）
+        if self.detection_result_slot_origin is not None:
+            for info in self.detection_result_slot_origin:
+                x, y = int(info[0]), int(info[1])
+                cv2.circle(frame, (x, y), 4, (255, 0, 255), -1)
+
         return frame
 
     def run(self, window_name="Real-Time Dual Model Detection"):
@@ -474,16 +632,20 @@ class RealTimePoseDetector:
             "cross": self.detection_result_cross if self.detection_result_cross else [],
             "board_angle": self.detection_result_board_angle if self.detection_result_board_angle is not None else None,
             "board_position": self.detection_result_board_position if self.detection_result_board_position is not None else None,
-            "u": self.detection_result_u if self.detection_result_u else []
+            "u": self.detection_result_u if self.detection_result_u else [],
+            "slot": self.detection_result_slot if self.detection_result_slot else None,
+            "detect": len(self.detection_result_detect) if self.detection_result_detect is not None else 0,
         }
-        print(f"获取检测结果 - 螺钉：{result['stud']} | 十字交叉点：{result['cross']} | 板角度：{result['board_angle']} | 板位置：{result['board_position']} | U型件：{result['u']}")
+        print(f"获取检测结果 - 螺钉：{result['stud']} | 十字交叉点：{result['cross']} | 板角度：{result['board_angle']} | 板位置：{result['board_position']} | U型件：{result['u']} | 十字接缝：{result['slot']} | 检测到螺钉数量：{result['detect']}")
         return result
 
 # 全局配置
 CAMERA_INDEX = 0
 MODEL_PATH_STUD = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-stud\weights\stud-best-1280-14.pt"
-MODEL_PATH_CROSS = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-cross\weights\cross-x-1920-9.pt"
-MODEL_PATH_U = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-u\weights\u-l-1280-1.pt"
+MODEL_PATH_CROSS = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-cross\weights\yolo11-cross-x-1280-7.pt"
+MODEL_PATH_U = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-u\weights\u-l-1280-3.pt"
+MODEL_PATH_SLOT = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-slot\weights\slot-1280-2.pt"
+MODEL_PATH_DETECT = r"D:\_Project\视觉相机\ImageRecognition\runs\detect\train-nail\weights\detect-1280-3.pt"
 SAVE_FRAME_PATH = "data/frame.jpg"
 # DETECT_CONF = 0.05
 
@@ -493,6 +655,8 @@ detector = RealTimePoseDetector(
     model_path_stud=MODEL_PATH_STUD,
     model_path_cross=MODEL_PATH_CROSS,
     model_path_u=MODEL_PATH_U,
+    model_path_slot=MODEL_PATH_SLOT,
+    model_path_detect=MODEL_PATH_DETECT,
     save_frame_path=SAVE_FRAME_PATH
 )
 
