@@ -30,7 +30,6 @@ class VisionAPISocketServer:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((host, port))
         self.sock.listen(5)
-
     def start(self):
         """启动服务端"""
         print(f'Server started on {self.host}:{self.port}')
@@ -170,7 +169,11 @@ class VisionAPISocketServer:
                 slot_points = detect_result['slot']
                 response = {'slot_points': slot_points if slot_points is not None else None}
                 return self.clean_for_utf8(response)
-
+            elif req == 'detect_count':
+                detect_result = detector.get_result()
+                detect_count = detect_result['detect_count']
+                response = {'detect_count': detect_count if detect_count is not None else None}
+                return self.clean_for_utf8(response)
             elif req == 'get_frame':
                 """获取当前视频帧"""
                 from realtime_test_origin import get_shared_frame
@@ -187,7 +190,45 @@ class VisionAPISocketServer:
                 else:
                     response = {'success': False, 'error': 'No frame available'}
                 return self.clean_for_utf8(response)
-
+            elif req == 'model_cross_on':
+                result = detector.enable_model_cross()
+                return self.clean_for_utf8(result)
+            elif req == 'model_cross_off':
+                result = detector.disable_model_cross()
+                return self.clean_for_utf8(result)
+            elif req == 'model_stud_on':
+                result = detector.enable_model_stud()
+                return self.clean_for_utf8(result)
+            elif req == 'model_stud_off':
+                result = detector.disable_model_stud()
+                return self.clean_for_utf8(result)
+            elif req == 'model_u_on':
+                result = detector.enable_model_u()
+                return self.clean_for_utf8(result)
+            elif req == 'model_u_off':
+                result = detector.disable_model_u()
+                return self.clean_for_utf8(result)
+            elif req == 'model_slot_on':
+                result = detector.enable_model_slot()
+                return self.clean_for_utf8(result)
+            elif req == 'model_slot_off':
+                result = detector.disable_model_slot()
+                return self.clean_for_utf8(result)
+            elif req == 'model_detect_on':
+                result = detector.enable_model_detect()
+                return self.clean_for_utf8(result)
+            elif req == 'model_detect_off':
+                result = detector.disable_model_detect()
+                return self.clean_for_utf8(result)
+            elif req == 'model_board_on':
+                result = detector.enable_model_board()
+                return self.clean_for_utf8(result)
+            elif req == 'model_board_off':
+                result = detector.disable_model_board()
+                return self.clean_for_utf8(result)
+            elif req == 'model_status':
+                result = detector.get_model_status()
+                return self.clean_for_utf8({"success": True, "models": result})
             else:
                 return self.clean_for_utf8({"status": "connected", "message": "Server is ready"})
                 

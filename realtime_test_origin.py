@@ -59,16 +59,46 @@ class RealTimePoseDetector:
         """防止重复初始化"""
         if hasattr(self, '_initialized') and self._initialized:
             return
-        
+
+        import gc
+
         # 初始化核心属性
         self.camera_index = camera_index
         self.camera = Camera(device_index=camera_index)
         self.camera_connected = False
+
+        # 模型路径配置（保存路径以便动态加载）
+        self.model_path_stud = model_path_stud
+        self.model_path_cross = model_path_cross
+        self.model_path_u = model_path_u
+        self.model_path_slot = model_path_slot
+        self.model_path_detect = model_path_detect
+
+        # 模型对象（初始为None，按需加载）
         self.model_stud = None
         self.model_cross = None
         self.model_u = None
         self.model_slot = None
         self.model_detect = None
+
+        # 模型加载状态（是否已加载到GPU）
+        self.model_stud_loaded = False
+        self.model_cross_loaded = False
+        self.model_u_loaded = False
+        self.model_slot_loaded = False
+        self.model_detect_loaded = False
+
+        # 模型启用开关（是否执行检测）
+        self.model_stud_switch = False
+        self.model_cross_switch = False
+        self.model_u_switch = False
+        self.model_slot_switch = False
+        self.model_detect_switch = False
+        self.model_board_switch = False  # 实际上与cross共用
+
+        # 模型操作锁（保证线程安全）
+        self.model_lock = Lock()
+
         self.save_frame_path = save_frame_path
         self.frame_lock = Lock()
         self.current_frame = None
@@ -95,37 +125,264 @@ class RealTimePoseDetector:
         self.reconnect_interval = 1.0  # 重连间隔（秒）
         self.reconnect_attempts = 0  # 当前重连尝试次数
         self.is_reconnecting = False  # 是否正在重连中
-        
-        # 加载模型
-        if model_path_stud and os.path.exists(model_path_stud):
-            self.model_stud = YOLO(model_path_stud)
-            print(f"成功加载螺钉检测模型：{model_path_stud}")
-        else:
-            raise ValueError(f"螺钉模型路径不存在：{model_path_stud}")
-        
-        if model_path_cross and os.path.exists(model_path_cross):
-            self.model_cross = YOLO(model_path_cross)
-            print(f"成功加载十字交叉点检测模型：{model_path_cross}")
-        else:
-            raise ValueError(f"十字交叉点模型路径不存在：{model_path_cross}")
-        if model_path_u and os.path.exists(model_path_u):
-            self.model_u = YOLO(model_path_u)
-            print(f"成功加载U型件六角螺套检测模型:{model_path_u}")
-        else:
-            raise ValueError(f"U型件六角螺套模型路径不存在：{model_path_u}")
-        if model_path_slot and os.path.exists(model_path_slot):
-            self.model_slot = YOLO(model_path_slot)
-            print(f"成功加载十字接缝检测模型:{model_path_slot}")
-        else:
-            raise ValueError(f"十字接缝模型路径不存在：{model_path_slot}")
-        if model_path_detect and os.path.exists(model_path_detect):
-            self.model_detect = YOLO(model_path_detect)
-            print(f"成功加载螺钉反馈检测模型:{model_path_detect}")
-        else:
-            raise ValueError(f"螺钉反馈检测模型路径不存在：{model_path_detect}")
+
+        # 验证模型路径是否存在
+        self._validate_model_paths()
+
         self._initialized = True  # 标记已初始化
+        print("检测器初始化完成（模型已配置，初始全部加载，按需开关）")
+        self.enable_model_detect()
+        self.enable_model_stud()
+        self.enable_model_u()
+        self.enable_model_slot()
+        self.enable_model_cross()
+        self.enable_model_board()
 
 
+    def _validate_model_paths(self):
+        """验证所有模型路径是否存在"""
+        paths = {
+            'stud': self.model_path_stud,
+            'cross': self.model_path_cross,
+            'u': self.model_path_u,
+            'slot': self.model_path_slot,
+            'detect': self.model_path_detect
+        }
+
+        for model_name, path in paths.items():
+            if not path or not os.path.exists(path):
+                raise ValueError(f"{model_name} 模型路径不存在：{path}")
+        print("所有模型路径验证通过")
+
+    def _load_model_to_gpu(self, model_path):
+        """将模型从磁盘加载到GPU"""
+        try:
+            model = YOLO(model_path)
+            # 预热模型（执行一次推理，确保完全加载到GPU）
+            dummy_input = np.zeros((640, 640, 3), dtype=np.uint8)
+            _ = model.predict(source=dummy_input, imgsz=640, conf=0.5, verbose=False, save=False, show=False)
+            return model
+        except Exception as e:
+            print(f"加载模型失败 {model_path}: {e}")
+            raise
+
+    def _unload_model_from_gpu(self, model):
+        """从GPU卸载模型并释放显存"""
+        import torch
+        import gc
+
+        try:
+            if model is not None:
+                # 删除模型对象
+                del model
+
+            # 清空CUDA缓存
+            torch.cuda.empty_cache()
+
+            # 强制垃圾回收
+            gc.collect()
+
+        except Exception as e:
+            print(f"卸载模型时出错: {e}")
+
+    # ===================== 【模型启用/禁用接口】=====================
+
+    def enable_model_stud(self):
+        """启用螺钉检测模型（加载到GPU并启用开关）"""
+        with self.model_lock:
+            if not self.model_stud_loaded:
+                print("正在加载螺钉检测模型...")
+                self.model_stud = self._load_model_to_gpu(self.model_path_stud)
+                self.model_stud_loaded = True
+                print(f"螺钉检测模型加载成功: {self.model_path_stud}")
+            self.model_stud_switch = True
+            return {"success": True, "message": "螺钉检测模型已启用"}
+
+    def disable_model_stud(self):
+        """禁用螺钉检测模型（卸载GPU并关闭开关）"""
+        with self.model_lock:
+            self.model_stud_switch = False
+            if self.model_stud_loaded:
+                print("正在卸载螺钉检测模型...")
+                self._unload_model_from_gpu(self.model_stud)
+                self.model_stud = None
+                self.model_stud_loaded = False
+                self.detection_result_stud = None  # 清空检测结果
+                print("螺钉检测模型已卸载，显存已释放")
+            return {"success": True, "message": "螺钉检测模型已禁用"}
+
+    def enable_model_cross(self):
+        """启用十字交叉点检测模型"""
+        with self.model_lock:
+            if not self.model_cross_loaded:
+                print("正在加载十字交叉点检测模型...")
+                self.model_cross = self._load_model_to_gpu(self.model_path_cross)
+                self.model_cross_loaded = True
+                print(f"十字交叉点检测模型加载成功: {self.model_path_cross}")
+            self.model_cross_switch = True
+            return {"success": True, "message": "十字交叉点检测模型已启用"}
+
+    def disable_model_cross(self):
+        """禁用十字交叉点检测模型"""
+        with self.model_lock:
+            self.model_cross_switch = False
+            # 检查board模型是否也需要
+            if not self.model_board_switch:
+                # board也关闭时才卸载模型
+                if self.model_cross_loaded:
+                    print("正在卸载十字交叉点检测模型...")
+                    self._unload_model_from_gpu(self.model_cross)
+                    self.model_cross = None
+                    self.model_cross_loaded = False
+                    self.detection_result_cross = None
+                    self.detection_result_board = None
+                    self.detection_result_board_angle = None
+                    self.detection_result_board_position = None
+                    print("十字交叉点检测模型已卸载，显存已释放")
+            else:
+                print("十字交叉点检测开关已关闭（装板检测仍使用该模型，模型保持加载）")
+            return {"success": True, "message": "十字交叉点检测模型已禁用"}
+
+    def enable_model_board(self):
+        """启用装板检测模型（与cross共用模型）"""
+        with self.model_lock:
+            if not self.model_cross_loaded:
+                print("正在加载装板检测模型...")
+                self.model_cross = self._load_model_to_gpu(self.model_path_cross)
+                self.model_cross_loaded = True
+                print(f"装板检测模型加载成功: {self.model_path_cross}")
+            self.model_board_switch = True
+            return {"success": True, "message": "装板检测模型已启用"}
+
+    def disable_model_board(self):
+        """禁用装板检测模型"""
+        with self.model_lock:
+            self.model_board_switch = False
+            # 检查cross模型是否也需要
+            if not self.model_cross_switch:
+                # cross也关闭时才卸载模型
+                if self.model_cross_loaded:
+                    print("正在卸载装板检测模型...")
+                    self._unload_model_from_gpu(self.model_cross)
+                    self.model_cross = None
+                    self.model_cross_loaded = False
+                    self.detection_result_cross = None
+                    self.detection_result_board = None
+                    self.detection_result_board_angle = None
+                    self.detection_result_board_position = None
+                    print("装板检测模型已卸载，显存已释放")
+            else:
+                print("装板检测开关已关闭（十字交叉点检测仍使用该模型，模型保持加载）")
+            return {"success": True, "message": "装板检测模型已禁用"}
+
+    def enable_model_u(self):
+        """启用U型件检测模型"""
+        with self.model_lock:
+            if not self.model_u_loaded:
+                print("正在加载U型件检测模型...")
+                self.model_u = self._load_model_to_gpu(self.model_path_u)
+                self.model_u_loaded = True
+                print(f"U型件检测模型加载成功: {self.model_path_u}")
+            self.model_u_switch = True
+            return {"success": True, "message": "U型件检测模型已启用"}
+
+    def disable_model_u(self):
+        """禁用U型件检测模型"""
+        with self.model_lock:
+            self.model_u_switch = False
+            if self.model_u_loaded:
+                print("正在卸载U型件检测模型...")
+                self._unload_model_from_gpu(self.model_u)
+                self.model_u = None
+                self.model_u_loaded = False
+                self.detection_result_u = None
+                print("U型件检测模型已卸载，显存已释放")
+            return {"success": True, "message": "U型件检测模型已禁用"}
+
+    def enable_model_slot(self):
+        """启用十字接缝检测模型"""
+        with self.model_lock:
+            if not self.model_slot_loaded:
+                print("正在加载十字接缝检测模型...")
+                self.model_slot = self._load_model_to_gpu(self.model_path_slot)
+                self.model_slot_loaded = True
+                print(f"十字接缝检测模型加载成功: {self.model_path_slot}")
+            self.model_slot_switch = True
+            return {"success": True, "message": "十字接缝检测模型已启用"}
+
+    def disable_model_slot(self):
+        """禁用十字接缝检测模型"""
+        with self.model_lock:
+            self.model_slot_switch = False
+            if self.model_slot_loaded:
+                print("正在卸载十字接缝检测模型...")
+                self._unload_model_from_gpu(self.model_slot)
+                self.model_slot = None
+                self.model_slot_loaded = False
+                self.detection_result_slot = None
+                self.detection_result_slot_origin = None
+                print("十字接缝检测模型已卸载，显存已释放")
+            return {"success": True, "message": "十字接缝检测模型已禁用"}
+
+    def enable_model_detect(self):
+        """启用螺钉反馈检测模型"""
+        with self.model_lock:
+            if not self.model_detect_loaded:
+                print("正在加载螺钉反馈检测模型...")
+                self.model_detect = self._load_model_to_gpu(self.model_path_detect)
+                self.model_detect_loaded = True
+                print(f"螺钉反馈检测模型加载成功: {self.model_path_detect}")
+            self.model_detect_switch = True
+            return {"success": True, "message": "螺钉反馈检测模型已启用"}
+
+    def disable_model_detect(self):
+        """禁用螺钉反馈检测模型"""
+        with self.model_lock:
+            self.model_detect_switch = False
+            if self.model_detect_loaded:
+                print("正在卸载螺钉反馈检测模型...")
+                self._unload_model_from_gpu(self.model_detect)
+                self.model_detect = None
+                self.model_detect_loaded = False
+                self.detection_result_detect = None
+                print("螺钉反馈检测模型已卸载，显存已释放")
+            return {"success": True, "message": "螺钉反馈检测模型已禁用"}
+
+    def get_model_status(self):
+        """获取所有模型的状态"""
+        return {
+            "stud": {
+                "loaded": self.model_stud_loaded,
+                "enabled": self.model_stud_switch,
+                "path": self.model_path_stud
+            },
+            "cross": {
+                "loaded": self.model_cross_loaded,
+                "enabled": self.model_cross_switch,
+                "path": self.model_path_cross
+            },
+            "board": {
+                "loaded": self.model_cross_loaded,
+                "enabled": self.model_board_switch,
+                "path": self.model_path_cross
+            },
+            "u": {
+                "loaded": self.model_u_loaded,
+                "enabled": self.model_u_switch,
+                "path": self.model_path_u
+            },
+            "slot": {
+                "loaded": self.model_slot_loaded,
+                "enabled": self.model_slot_switch,
+                "path": self.model_path_slot
+            },
+            "detect": {
+                "loaded": self.model_detect_loaded,
+                "enabled": self.model_detect_switch,
+                "path": self.model_path_detect
+            }
+        }
+    # =====================================================================
 
     # ===================== 【新增：伽马调整相关方法】=====================
     def calculate_brightness(self, image):
@@ -268,75 +525,90 @@ class RealTimePoseDetector:
                     if self.current_frame is None:
                         continue
                     frame_to_detect = self.current_frame.copy()
-                # 螺钉检测 - 先处理帧（伽马调整）
+
+                # 检测信息置零
+                detection_info_stud = None
+                detection_info_cross_all = None
+                detection_info_cross_single = None
+                detection_info_board_position = None
+                detection_info_board_angle = None
+                detection_info_u = None
+                detection_info_slot = None
+                detection_info_detect = None
+
                 intensive_frame, avg_bright, gamma = self.process_frame(frame_to_detect)
-                results_stud = self.model_stud.predict(
-                    source=intensive_frame,
-                    imgsz=1280,
-                    conf=0,
-                    save=False,
-                    show=False,
-                    verbose=False,
-                    stream=True,
-                    max_det=1
-                    
-                )
-                detection_info_stud = self._parse_detection_results(results_stud, self.model_stud)
+
+                # 螺钉检测 - 先处理帧（伽马调整）
+                if self.model_stud_switch:
+                    results_stud = self.model_stud.predict(
+                        source=intensive_frame,
+                        imgsz=1280,
+                        conf=0,
+                        save=False,
+                        show=False,
+                        verbose=False,
+                        stream=True,
+                        max_det=1
+                        
+                    )
+                    detection_info_stud = self._parse_detection_results(results_stud, self.model_stud)
 
                 # 十字交叉点检测，碰钉十字线和装板十字线定位公用同一模型，检测结果中区分
-                results_cross = self.model_cross.predict(
-                    source=intensive_frame,
-                    imgsz=1280,
-                    conf=0,
-                    save=False,
-                    show=False,
-                    verbose=False,
-                    stream=True,
-                    max_det=2,#若后续装板十字线设置3个检测点，则这里需要改为3，请注意！！！
-                    # save_txt=True,
-                    # save_conf=True,
-                )
-                detection_info_cross_all, detection_info_cross_single = self._parse_detection_results_with_confidence(results_cross, self.model_cross)
-                detection_info_board_angle = self.calculate_board_angle(detection_info_cross_all)
-                detection_info_board_position = self.calculate_board_position(detection_info_cross_all)
+                if self.model_cross_switch or self.model_board_switch:
+                    results_cross = self.model_cross.predict(
+                        source=intensive_frame,
+                        imgsz=1280,
+                        conf=0,
+                        save=False,
+                        show=False,
+                        verbose=False,
+                        stream=True,
+                        max_det=2,#若后续装板十字线设置3个检测点，则这里需要改为3，请注意！！！
+                        # save_txt=True,
+                        # save_conf=True,
+                    )
+                    detection_info_cross_all, detection_info_cross_single = self._parse_detection_results_with_confidence(results_cross, self.model_cross)
+                    detection_info_board_angle = self.calculate_board_angle(detection_info_cross_all)
+                    detection_info_board_position = self.calculate_board_position(detection_info_cross_all)
     
+                if self.model_u_switch:
+                    # U型件六角螺套检测
+                    results_u = self.model_u.predict(
+                        source=intensive_frame,
+                        imgsz=1280,
+                        conf=0.25,
+                        save=False,
+                        show=False,
+                        verbose=False,
+                        stream=True,
+                        max_det=1
+                    )
+                    detection_info_u = self._parse_detection_results(results_u, self.model_u)
+                if self.model_slot_switch:
+                    results_slot = self.model_slot.predict(
+                        source=intensive_frame,
+                        imgsz=1280,
+                        conf=0.25,
+                        save=False,
+                        show=False,
+                        verbose=False,
+                        stream=True,
+                        max_det=1
+                    )
+                    detection_info_slot_origin = self._parse_detection_results(results_slot, self.model_slot)#保存原始检测点位置信息，供后续计算使用
+                    detection_info_slot = self.calculate_slot_position(detection_info_slot_origin)#计算十字接缝位置（使用所有点的几何中心）
 
-                # U型件六角螺套检测
-                results_u = self.model_u.predict(
-                    source=intensive_frame,
-                    imgsz=1280,
-                    conf=0.25,
-                    save=False,
-                    show=False,
-                    verbose=False,
-                    stream=True,
-                    max_det=1
-                )
-                detection_info_u = self._parse_detection_results(results_u, self.model_u)
-
-                results_slot = self.model_slot.predict(
-                    source=intensive_frame,
-                    imgsz=1280,
-                    conf=0.25,
-                    save=False,
-                    show=False,
-                    verbose=False,
-                    stream=True,
-                    max_det=1
-                )
-                detection_result_slot_origin = self._parse_detection_results(results_slot, self.model_slot)#保存原始检测点位置信息，供后续计算使用
-                detection_result_slot = self.calculate_slot_position(detection_result_slot_origin)#计算十字接缝位置（使用所有点的几何中心）
-
-                results_detect = self.model_detect.predict(
-                    source=intensive_frame,
-                    imgsz=1280,
-                    conf=0.5,
-                    save=True,
-                    show=False,
-                    verbose=False,
-                    stream=True
-                )
-                detection_result_detect = self._parse_detection_results_box(results_detect, self.model_detect)
+                if self.model_detect_switch:
+                    results_detect = self.model_detect.predict(
+                        source=intensive_frame,
+                        imgsz=1280,
+                        conf=0.1,
+                        save=False,
+                        show=False,
+                        verbose=False,
+                        stream=True
+                    )
+                    detection_info_detect = self._parse_detection_results_box(results_detect, self.model_detect)
 
                 # 更新检测结果（使用锁保证线程安全）
                 with self.frame_lock:
@@ -346,8 +618,8 @@ class RealTimePoseDetector:
                     self.detection_result_u = detection_info_u
                     self.detection_result_board_angle = detection_info_board_angle
                     self.detection_result_board_position = detection_info_board_position
-                    self.detection_result_slot = detection_result_slot
-                    self.detection_result_detect = detection_result_detect
+                    self.detection_result_slot = detection_info_slot
+                    self.detection_result_detect = detection_info_detect
 
             except Exception as e:
                 print(f"检测线程出错: {e}")
@@ -438,7 +710,7 @@ class RealTimePoseDetector:
         box_info = []
         for result in results:
             if result.boxes is not None:
-                print(result.boxes)
+                # print(result.boxes)
                 for box in result.boxes:
                     x1, y1, x2, y2 = box.xyxy[0]
                     box_info.append([round(x1.item(), 2), round(y1.item(), 2), round(x2.item(), 2), round(y2.item(), 2)])
@@ -634,18 +906,18 @@ class RealTimePoseDetector:
             "board_position": self.detection_result_board_position if self.detection_result_board_position is not None else None,
             "u": self.detection_result_u if self.detection_result_u else [],
             "slot": self.detection_result_slot if self.detection_result_slot else None,
-            "detect": len(self.detection_result_detect) if self.detection_result_detect is not None else 0,
+            "detect_count": len(self.detection_result_detect) if self.detection_result_detect is not None else 0,
         }
-        print(f"获取检测结果 - 螺钉：{result['stud']} | 十字交叉点：{result['cross']} | 板角度：{result['board_angle']} | 板位置：{result['board_position']} | U型件：{result['u']} | 十字接缝：{result['slot']} | 检测到螺钉数量：{result['detect']}")
+        print(f"获取检测结果 - 螺钉：{result['stud']} | 十字交叉点：{result['cross']} | 板角度：{result['board_angle']} | 板位置：{result['board_position']} | U型件：{result['u']} | 十字接缝：{result['slot']} | 检测到螺钉数量：{result['detect_count']}")
         return result
 
 # 全局配置
 CAMERA_INDEX = 0
-MODEL_PATH_STUD = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-stud\weights\stud-best-1280-14.pt"
-MODEL_PATH_CROSS = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-cross\weights\yolo11-cross-x-1280-7.pt"
+MODEL_PATH_STUD = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-stud\weights\stud-best-1280-15.pt"
+MODEL_PATH_CROSS = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-cross\weights\yolo11-cross-x-1280-9.pt"
 MODEL_PATH_U = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-u\weights\u-l-1280-3.pt"
 MODEL_PATH_SLOT = r"D:\_Project\视觉相机\ImageRecognition\runs\pose\train-slot\weights\slot-1280-2.pt"
-MODEL_PATH_DETECT = r"D:\_Project\视觉相机\ImageRecognition\runs\detect\train-nail\weights\detect-1280-3.pt"
+MODEL_PATH_DETECT = r"D:\_Project\视觉相机\ImageRecognition\runs\detect\train-nail\weights\detect-1280-8.pt"
 SAVE_FRAME_PATH = "data/frame.jpg"
 # DETECT_CONF = 0.05
 
