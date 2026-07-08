@@ -576,7 +576,7 @@ class RealTimePoseDetector:
                     results_u = self.model_u.predict(
                         source=intensive_frame,
                         imgsz=1280,
-                        conf=0.25,
+                        conf=0.05,
                         save=False,
                         show=False,
                         verbose=False,
